@@ -1,3 +1,7 @@
 from .cae import build_cae_multitask, build_cae_restoration
 from .dncnn import build_dncnn_multitask, build_dncnn_restoration
-from .unet import build_unet_multitask, build_unet_baseline
+from .unet import build_unet_multitask, build_unet_restoration, build_unet_baseline
+from .multitask_unet import build_multitask_unet, create_model
+from .bam_model import build_bam_model, create_bam_model, preprocess_cifar10_data
+from .bam_restoration import build_bam_restoration_model, create_bam_restoration_model, preprocess_cifar10_restoration_data
+from .bam_classification import build_bam_classification_model, create_bam_classification_model, preprocess_cifar10_classification_data
