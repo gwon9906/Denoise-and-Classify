@@ -9,3 +9,6 @@ __pycache__/
 *.pywz
 *.pyzw
 *.pyzwz
+
+# large data
+data/*.npy
