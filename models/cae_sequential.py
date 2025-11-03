@@ -179,11 +179,11 @@ class SequentialCAE:
         self.restore_model = build_cae_restoration(input_shape)
         self.cls_model = build_cae_classification(input_shape, num_classes)
     
-    def compile_models(self, restore_lr=1e-3, cls_lr=1e-3):
+    def compile_models(self, restore_lr=1e-3, cls_lr=1e-3, restore_loss='mse'):
         """두 모델을 독립적으로 컴파일"""
         self.restore_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=restore_lr),
-            loss='mse',  # or 'mae'
+            loss=restore_loss,  # 'mse' or 'mae'
             metrics=['mse', 'mae']
         )
         
@@ -194,7 +194,7 @@ class SequentialCAE:
         )
     
     def train_stage1(self, x_noisy, x_clean, epochs=50, batch_size=128,
-                     validation_split=0.1):
+                     validation_split=0.1, callbacks=None):
         """Stage 1: 복원 학습"""
         print("\n" + "="*60)
         print("Stage 1: Training CAE Restoration")
@@ -205,26 +205,58 @@ class SequentialCAE:
             epochs=epochs,
             batch_size=batch_size,
             validation_split=validation_split,
+            callbacks=callbacks,
             verbose=1
         )
         return history1
     
     def train_stage2(self, x_noisy, y_labels, epochs=50, batch_size=128,
-                     validation_split=0.1):
+                     validation_split=0.1, callbacks=None):
         """Stage 2: 분류 학습"""
+        # 메모리 정리
+        import gc
+        gc.collect()
+        
         print("\n" + "="*60)
         print("Stage 2: Training CAE Classification")
         print("="*60)
         
-        # 복원
-        x_restored = self.restore_model.predict(x_noisy, batch_size=batch_size, verbose=0)
+        # ✅ 배치 단위로 복원 (메모리 효율)
+        print("Generating restored images for training...")
+        import numpy as np
+        
+        n_samples = len(x_noisy)
+        x_restored_list = []
+        
+        # 큰 청크로 나눠서 처리 (4배 배치 크기)
+        chunk_size = batch_size * 4
+        for i in range(0, n_samples, chunk_size):
+            end_idx = min(i + chunk_size, n_samples)
+            x_batch_restored = self.restore_model.predict(
+                x_noisy[i:end_idx],
+                batch_size=batch_size,
+                verbose=0
+            )
+            x_restored_list.append(x_batch_restored)
+            
+            # 진행 상황 출력
+            if (i // chunk_size) % 10 == 0:
+                print(f"  Processed {end_idx}/{n_samples} samples...")
+        
+        x_restored = np.concatenate(x_restored_list, axis=0)
+        del x_restored_list  # 메모리 해제
+        gc.collect()
+        
+        print(f"✓ Restored images shape: {x_restored.shape}")
         
         # 분류 학습
+        print("\nTraining classification model...")
         history2 = self.cls_model.fit(
             x_restored, y_labels,
             epochs=epochs,
             batch_size=batch_size,
             validation_split=validation_split,
+            callbacks=callbacks,
             verbose=1
         )
         return history2
@@ -237,4 +269,46 @@ class SequentialCAE:
         return {
             "restored": x_restored,
             "predictions": y_pred
+        }
+    
+    def evaluate(self, x_noisy, x_clean, y_labels, batch_size=128):
+        """
+        전체 파이프라인 평가
+        
+        Args:
+            x_noisy: 노이즈가 추가된 입력
+            x_clean: 깨끗한 이미지 (복원 평가용)
+            y_labels: 원-핫 인코딩된 레이블
+            batch_size: 배치 크기
+            
+        Returns:
+            dict: 복원 MSE/MAE/PSNR와 분류 정확도
+        """
+        outputs = self.predict(x_noisy, batch_size=batch_size)
+        
+        # 복원 성능
+        import numpy as np
+        mse = np.mean((outputs['restored'] - x_clean) ** 2)
+        mae = np.mean(np.abs(outputs['restored'] - x_clean))
+        psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float('inf')
+        
+        # 분류 성능
+        y_pred_classes = np.argmax(outputs['predictions'], axis=1)
+        y_true_classes = np.argmax(y_labels, axis=1)
+        accuracy = np.mean(y_pred_classes == y_true_classes)
+        
+        # Top-3 accuracy
+        top3_preds = np.argsort(outputs['predictions'], axis=1)[:, -3:]
+        top3_acc = np.mean([y_true in top3 for y_true, top3 in zip(y_true_classes, top3_preds)])
+        
+        return {
+            "restoration": {
+                "mse": float(mse),
+                "mae": float(mae),
+                "psnr": float(psnr)
+            },
+            "classification": {
+                "accuracy": float(accuracy),
+                "top3_accuracy": float(top3_acc)
+            }
         }

@@ -101,10 +101,7 @@ def build_multitask_unet(input_shape_img=(32, 32, 3), num_classes=10,
         [image_input, residual_pred]
     )
 
-    # =====================================
     # Task 2: Classification Head (Multi-scale)
-    # =====================================
-    # 다양한 스케일의 특징 결합
     gap_b = layers.GlobalAveragePooling2D(name='gap_bottleneck')(b)
     gap_d3 = layers.GlobalAveragePooling2D(name='gap_d3')(d3)
     gap_d1 = layers.GlobalAveragePooling2D(name='gap_d1')(d1)

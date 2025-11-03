@@ -47,9 +47,7 @@ def build_unet_restoration(input_shape=(32, 32, 3), dropout_rate=0.0, l2_reg=1e-
     # Input
     image_input = layers.Input(shape=input_shape, name="noisy_input")
 
-    # =====================================
     # Encoder (4 layers)
-    # =====================================
     c1 = conv_block(image_input, 32, 'enc1')  # 32x32
     p1 = layers.MaxPooling2D(2, name='pool1')(c1)
     
@@ -62,14 +60,10 @@ def build_unet_restoration(input_shape=(32, 32, 3), dropout_rate=0.0, l2_reg=1e-
     c4 = conv_block(p3, 256, 'enc4')  # 4x4
     p4 = layers.MaxPooling2D(2, name='pool4')(c4)
 
-    # =====================================
     # Bottleneck
-    # =====================================
     b = conv_block(p4, 512, 'bottleneck')  # 2x2
 
-    # =====================================
     # Decoder (4 layers) with skip connections
-    # =====================================
     d4 = layers.Conv2DTranspose(256, 2, strides=2, padding='same',
                                name='upsample4')(b)  # 4x4
     d4 = layers.Concatenate(name='concat4')([d4, c4])
@@ -90,9 +84,7 @@ def build_unet_restoration(input_shape=(32, 32, 3), dropout_rate=0.0, l2_reg=1e-
     d1 = layers.Concatenate(name='concat1')([d1, c1])
     d1 = conv_block(d1, 32, 'dec1')
 
-    # =====================================
     # Restoration Output (Residual Learning)
-    # =====================================
     # 노이즈(residual)를 예측하고, input에서 빼서 복원
     residual_pred = layers.Conv2D(3, 1, activation='linear',
                                   name="residual_pred")(d1)
@@ -331,20 +323,45 @@ class SequentialUNet:
         Returns:
             학습 히스토리
         """
+        # 메모리 정리
+        import gc
+        gc.collect()
+        
         print("\n" + "="*60)
         print("Stage 2: Training Classification U-Net")
         print("="*60)
         print(f"Dropout rate: {self.cls_dropout}")
         
-        # Stage 1으로 노이즈 제거
+        # ✅ 배치 단위로 복원 (메모리 효율)
         print("Restoring training data...")
-        x_restored = self.restore_model.predict(
-            x_noisy,
-            batch_size=batch_size,
-            verbose=1
-        )
+        import numpy as np
+        
+        n_samples = len(x_noisy)
+        x_restored_list = []
+        
+        # 큰 청크로 나눠서 처리 (4배 배치 크기)
+        chunk_size = batch_size * 4
+        for i in range(0, n_samples, chunk_size):
+            end_idx = min(i + chunk_size, n_samples)
+            x_batch_restored = self.restore_model.predict(
+                x_noisy[i:end_idx],
+                batch_size=batch_size,
+                verbose=0
+            )
+            x_restored_list.append(x_batch_restored)
+            
+            # 진행 상황 출력
+            if (i // chunk_size) % 10 == 0:
+                print(f"  Processed {end_idx}/{n_samples} samples...")
+        
+        x_restored = np.concatenate(x_restored_list, axis=0)
+        del x_restored_list  # 메모리 해제
+        gc.collect()
+        
+        print(f"✓ Restored images shape: {x_restored.shape}")
         
         # 복원된 데이터로 분류 모델 학습
+        print("\nTraining classification model...")
         history2 = self.cls_model.fit(
             x_restored, y_labels,
             epochs=epochs,

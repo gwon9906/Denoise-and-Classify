@@ -1,331 +1,219 @@
-"""
-MTL BAM (Bidirectional Associative Memory) Model
-Multi-Task Learning for simultaneous denoising and classification
-"""
-
+# MF-BAM MTL 및 Cascade 모델
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-import numpy as np
+from tensorflow.keras import layers, Model
+from .bam_mf import MF, build_mf_module, build_decoder
+from .bam import BAM, BAMAssociativeLayer
 
+# ============================================
+# MTL 구조 (MF features → BAM)
+# ============================================
 
-class TiedDense(layers.Layer):
+def build_mf_bam_mtl(input_shape=(3072,), num_classes=10):
     """
-    Tied Dense layer - uses transposed weights for decoding
-    """
-    def __init__(self, units, tied_to=None, activation=None, **kwargs):
-        super(TiedDense, self).__init__(**kwargs)
-        self.units = units
-        self.tied_to = tied_to
-        self.activation = keras.activations.get(activation)
+    MF-BAM MTL 모델
+    
+    구조:
+    Input → MF Encoder → [Decoder → Restoration, BAM → Classification]
+    
+    Args:
+        input_shape: 입력 shape (flatten)
+        num_classes: 분류 클래스 수
         
-    def build(self, input_shape):
-        if self.tied_to is None:
-            # Encoder: create new weights
-            self.kernel = self.add_weight(
-                name='kernel',
-                shape=(input_shape[-1], self.units),
-                initializer='glorot_uniform',
-                trainable=True
-            )
+    Returns:
+        Keras Model with 2 outputs: [restoration, classification]
+    """
+    inp = layers.Input(shape=input_shape, name='flatten_input')
+    
+    # MF 인코더 (특성 추출)
+    mf_feat = build_mf_module(inp, hidden_units=[1024, 768, 512, 256])
+    
+    # 복원 헤드
+    rec = build_decoder(mf_feat, decoder_units=[512, 768, 1024], original_dim=input_shape[0])
+    
+    # 분류 헤드 (BAM)
+    cls_logits = BAMAssociativeLayer(
+        mf_feat.shape[-1],
+        num_classes,
+        steps=5,
+        temp=0.5,
+        name='bam_assoc'
+    )(mf_feat)
+    
+    cls = layers.Activation('softmax', name='classification_output')(cls_logits)
+    
+    return Model(inputs=inp, outputs=[rec, cls], name="MF_BAM_MTL")
+
+
+# ============================================
+# Cascade 구조 (MF → Restoration → BAM)
+# ============================================
+
+def build_mf_bam_cascade(input_shape=(3072,), num_classes=10):
+    """
+    MF-BAM Cascade 모델
+    
+    구조:
+    Input → MF → Restored Image → BAM → Classification
+    
+    Args:
+        input_shape: 입력 shape (flatten)
+        num_classes: 분류 클래스 수
+        
+    Returns:
+        Keras Model with 2 outputs: [restoration, classification]
+    """
+    inp = layers.Input(shape=input_shape, name='flatten_input')
+    
+    # MF 인코더
+    mf_feat = build_mf_module(inp, hidden_units=[1024, 768, 512, 256])
+    
+    # 복원
+    rec = build_decoder(mf_feat, decoder_units=[512, 768, 1024], original_dim=input_shape[0])
+    
+    # 복원된 이미지를 BAM 입력으로 사용
+    cls_logits = BAMAssociativeLayer(
+        rec.shape[-1],  # restored image dimension
+        num_classes,
+        steps=5,
+        temp=0.5,
+        name='bam_assoc'
+    )(rec)
+    
+    cls = layers.Activation('softmax', name='classification_output')(cls_logits)
+    
+    return Model(inputs=inp, outputs=[rec, cls], name="MF_BAM_CASCADE")
+
+
+# ============================================
+# MTLModel 클래스 (기존 호환성 유지)
+# ============================================
+
+class MTLModel(tf.keras.Model):
+    """
+    MF-BAM MTL 모델 (복원+분류 동시 출력)
+    
+    기존 코드와의 호환성을 위해 유지
+    """
+    
+    def __init__(self, mf_module: MF = None, bam_module: BAM = None,
+                 input_dim=3072, num_classes=10):
+        """
+        Args:
+            mf_module: MF 모듈 (선택적)
+            bam_module: BAM 모듈 (선택적)
+            input_dim: 입력 차원
+            num_classes: 분류 클래스 수
+        """
+        super().__init__()
+        
+        # MF 모듈
+        if mf_module is None:
+            self.mf = MF(input_dim=input_dim, encoder_dims=[1024, 768, 512, 256])
         else:
-            # Decoder: use transposed encoder weights
-            self.kernel = self.tied_to.kernel
-            
-        self.bias = self.add_weight(
-            name='bias',
-            shape=(self.units,),
-            initializer='zeros',
-            trainable=True
-        )
-        super(TiedDense, self).build(input_shape)
-    
-    def call(self, inputs):
-        if self.tied_to is None:
-            # Encoder: normal multiplication
-            output = tf.matmul(inputs, self.kernel)
+            self.mf = mf_module
+        
+        # BAM 모듈
+        if bam_module is None:
+            latent_dim = 256  # MF의 마지막 차원
+            self.bam = BAM(input_dim=latent_dim, output_dim=num_classes)
         else:
-            # Decoder: transposed multiplication
-            output = tf.matmul(inputs, self.kernel, transpose_b=True)
-        
-        output = tf.nn.bias_add(output, self.bias)
-        
-        if self.activation is not None:
-            output = self.activation(output)
-        
-        return output
+            self.bam = bam_module
     
-    def get_config(self):
-        config = super(TiedDense, self).get_config()
-        config.update({
-            'units': self.units,
-            'activation': keras.activations.serialize(self.activation)
-        })
-        return config
+    def call(self, x, training=None):
+        # MF 모듈로 입력 복원 및 은닉표현 얻기
+        recon, z = self.mf(x, training=training)
+        
+        # 은닉표현을 BAM 분류기에 통과시켜 클래스 패턴 출력
+        class_out = self.bam(z)
+        
+        # Softmax 적용
+        class_out = tf.nn.softmax(class_out)
+        
+        # 두 출력을 튜플로 반환
+        return recon, class_out
 
 
-class MTLBAM:
+# ============================================
+# 모델 생성 함수
+# ============================================
+
+def create_mf_bam_model(model_type='mtl',
+                        input_shape=(3072,),
+                        num_classes=10,
+                        recon_weight=0.7,
+                        cls_weight=0.3,
+                        learning_rate=2e-4):
     """
-    Multi-Task Learning BAM Model
+    MF-BAM 모델 생성 및 컴파일
     
-    Simultaneously learns:
-    1. Image reconstruction (denoising)
-    2. Image classification
-    
-    Uses shared encoder with two decoder heads
+    Args:
+        model_type: 'mtl' 또는 'cascade'
+        input_shape: 입력 shape
+        num_classes: 분류 클래스 수
+        recon_weight: 복원 손실 가중치
+        cls_weight: 분류 손실 가중치
+        learning_rate: 학습률
+        
+    Returns:
+        컴파일된 Keras Model
     """
+    if model_type == 'mtl':
+        model = build_mf_bam_mtl(input_shape, num_classes)
+    elif model_type == 'cascade':
+        model = build_mf_bam_cascade(input_shape, num_classes)
+    else:
+        raise ValueError(f"Invalid model_type: {model_type}")
     
-    def __init__(self, input_dim=3072, latent_dim=256, num_classes=10,
-                 recon_weight=0.7, cls_weight=0.3, 
-                 learning_rate=1e-3, recon_loss='mse'):
-        """
-        Args:
-            input_dim: Input dimension (3072 for CIFAR-10)
-            latent_dim: Latent dimension
-            num_classes: Number of classes
-            recon_weight: Weight for reconstruction loss
-            cls_weight: Weight for classification loss
-            learning_rate: Learning rate
-            recon_loss: Reconstruction loss ('mse' or 'mae')
-        """
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.num_classes = num_classes
-        self.recon_weight = recon_weight
-        self.cls_weight = cls_weight
-        self.learning_rate = learning_rate
-        self.recon_loss_type = recon_loss
-        
-        # Build model
-        self.model = self._build_model()
-        self._compile_model()
-    
-    def _build_model(self):
-        """
-        Build MTL BAM model
-        """
-        # Input
-        inputs = layers.Input(shape=(self.input_dim,), name='noisy_input')
-        
-        # Shared Encoder
-        enc1 = TiedDense(512, activation='relu', name='shared_enc1')
-        enc2 = TiedDense(self.latent_dim, activation='relu', name='shared_enc2')
-        
-        x = enc1(inputs)
-        x = layers.Dropout(0.2)(x)
-        latent = enc2(x)
-        latent = layers.Dropout(0.2)(latent)
-        
-        # Reconstruction Decoder (tied weights)
-        dec2 = TiedDense(512, tied_to=enc2, activation='relu', name='recon_dec2')
-        dec1 = TiedDense(self.input_dim, tied_to=enc1, activation='sigmoid', name='recon_dec1')
-        
-        x_recon = dec2(latent)
-        x_recon = layers.Dropout(0.2)(x_recon)
-        reconstruction = dec1(x_recon)
-        
-        # Classification Head
-        x_cls = layers.Dense(256, activation='relu', name='cls_fc1')(latent)
-        x_cls = layers.Dropout(0.3)(x_cls)
-        x_cls = layers.Dense(128, activation='relu', name='cls_fc2')(x_cls)
-        x_cls = layers.Dropout(0.3)(x_cls)
-        classification = layers.Dense(self.num_classes, activation='softmax', name='cls_output')(x_cls)
-        
-        # Build model
-        model = keras.Model(
-            inputs=inputs,
-            outputs={
-                'reconstruction_output': reconstruction,
-                'classification_output': classification
-            },
-            name='mtl_bam'
-        )
-        
-        return model
-    
-    def _compile_model(self):
-        """
-        Compile model with weighted multi-task losses
-        """
-        # Loss functions
-        if self.recon_loss_type == 'mse':
-            recon_loss = 'mse'
-        elif self.recon_loss_type == 'mae':
-            recon_loss = 'mae'
-        else:
-            recon_loss = 'mse'
-        
-        # Compile
-        self.model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss={
-                'reconstruction_output': recon_loss,
-                'classification_output': 'categorical_crossentropy'
-            },
-            loss_weights={
-                'reconstruction_output': self.recon_weight,
-                'classification_output': self.cls_weight
-            },
-            metrics={
-                'reconstruction_output': ['mse', 'mae'],
-                'classification_output': ['accuracy', 
-                                          keras.metrics.TopKCategoricalAccuracy(k=3, name='top3_acc')]
-            }
-        )
-        
-        print("✓ MTL BAM model compiled")
-        print(f"  Reconstruction weight: {self.recon_weight}")
-        print(f"  Classification weight: {self.cls_weight}")
-    
-    def train(self, x_noisy, x_clean, y_labels, epochs=100, batch_size=128,
-              validation_split=0.2, callbacks=None, verbose=1):
-        """
-        Train MTL model
-        
-        Args:
-            x_noisy: Noisy input images (flattened)
-            x_clean: Clean target images (flattened)
-            y_labels: One-hot encoded labels
-            epochs: Number of epochs
-            batch_size: Batch size
-            validation_split: Validation split ratio
-            callbacks: List of callbacks
-            verbose: Verbosity mode
-        
-        Returns:
-            Training history
-        """
-        print("\n" + "="*60)
-        print("Training MTL BAM")
-        print("="*60)
-        
-        history = self.model.fit(
-            x_noisy,
-            {
-                'reconstruction_output': x_clean,
-                'classification_output': y_labels
-            },
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=validation_split,
-            callbacks=callbacks,
-            verbose=verbose
-        )
-        
-        print("\n✓ Training complete!")
-        return history
-    
-    def predict(self, x_noisy, batch_size=128):
-        """
-        Predict both reconstruction and classification
-        
-        Args:
-            x_noisy: Noisy input images (flattened)
-            batch_size: Batch size
-        
-        Returns:
-            Dictionary with 'reconstruction' and 'classification' keys
-        """
-        predictions = self.model.predict(x_noisy, batch_size=batch_size, verbose=0)
-        return predictions
-    
-    def evaluate_detailed(self, x_noisy, x_clean, y_labels, batch_size=128):
-        """
-        Detailed evaluation of both tasks
-        
-        Args:
-            x_noisy: Noisy input images (flattened)
-            x_clean: Clean reference images (flattened)
-            y_labels: One-hot encoded labels
-            batch_size: Batch size
-        
-        Returns:
-            Dictionary with detailed metrics
-        """
-        print("\n" + "="*60)
-        print("Evaluating MTL BAM")
-        print("="*60)
-        
-        # Get predictions
-        predictions = self.predict(x_noisy, batch_size=batch_size)
-        x_recon = predictions['reconstruction_output']
-        y_pred = predictions['classification_output']
-        
-        # Reconstruction metrics
-        mse = np.mean((x_recon - x_clean) ** 2)
-        mae = np.mean(np.abs(x_recon - x_clean))
-        psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else 100
-        
-        # Classification metrics
-        pred_classes = np.argmax(y_pred, axis=1)
-        true_classes = np.argmax(y_labels, axis=1)
-        accuracy = np.mean(pred_classes == true_classes)
-        
-        # Top-3 accuracy
-        top3_preds = np.argsort(y_pred, axis=1)[:, -3:]
-        top3_acc = np.mean([true_classes[i] in top3_preds[i] for i in range(len(true_classes))])
-        
-        results = {
-            'reconstruction': {
-                'mse': float(mse),
-                'mae': float(mae),
-                'psnr': float(psnr)
-            },
-            'classification': {
-                'accuracy': float(accuracy),
-                'top3_accuracy': float(top3_acc)
-            }
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate),
+        loss={
+            "restoration_output": keras.losses.MeanSquaredError(),
+            "classification_output": keras.losses.CategoricalCrossentropy()
+        },
+        loss_weights={
+            "restoration_output": recon_weight,
+            "classification_output": cls_weight
+        },
+        metrics={
+            "restoration_output": [keras.metrics.MeanAbsoluteError(name='mae')],
+            "classification_output": [
+                keras.metrics.CategoricalAccuracy(name='accuracy'),
+                keras.metrics.TopKCategoricalAccuracy(k=3, name='top3_acc')
+            ]
         }
-        
-        print("\nReconstruction Performance:")
-        print(f"  MSE:  {mse:.6f}")
-        print(f"  MAE:  {mae:.6f}")
-        print(f"  PSNR: {psnr:.2f} dB")
-        
-        print("\nClassification Performance:")
-        print(f"  Accuracy:     {accuracy:.4f}")
-        print(f"  Top-3 Acc:    {top3_acc:.4f}")
-        
-        return results
-    
-    def save_model(self, filepath):
-        """
-        Save model
-        
-        Args:
-            filepath: Path to save the model
-        """
-        self.model.save(filepath)
-        print(f"✓ Model saved: {filepath}")
-    
-    def load_model(self, filepath):
-        """
-        Load model
-        
-        Args:
-            filepath: Path to the saved model
-        """
-        self.model = keras.models.load_model(filepath, 
-                                             custom_objects={'TiedDense': TiedDense})
-        print(f"✓ Model loaded: {filepath}")
-
-
-# Example usage
-if __name__ == "__main__":
-    print("MTL BAM Model for CIFAR-10")
-    print("="*60)
-    
-    # Create model
-    model = MTLBAM(
-        input_dim=3072,      # 32*32*3
-        latent_dim=256,
-        num_classes=10,
-        recon_weight=0.7,
-        cls_weight=0.3
     )
     
-    # Show architecture
-    print("\n[Model Architecture]")
-    model.model.summary()
+    return model
+
+
+# ============================================
+# 사용 예제
+# ============================================
+
+if __name__ == "__main__":
+    print("Creating MF-BAM models...")
     
-    print("\n✓ MTL BAM created successfully!")
+    # MTL 모델 생성
+    print("\n" + "="*60)
+    print("MTL Model")
+    print("="*60)
+    mtl_model = create_mf_bam_model(
+        model_type='mtl',
+        input_shape=(3072,),
+        num_classes=10
+    )
+    mtl_model.summary()
+    
+    # Cascade 모델 생성
+    print("\n" + "="*60)
+    print("Cascade Model")
+    print("="*60)
+    cascade_model = create_mf_bam_model(
+        model_type='cascade',
+        input_shape=(3072,),
+        num_classes=10
+    )
+    cascade_model.summary()
+    
+    print("\n✓ Models created successfully")

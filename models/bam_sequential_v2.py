@@ -1,110 +1,151 @@
-# Sequential MF-BAM 모델 (연쇄 학습)
+"""
+BAM Sequential Model v2 - 개선된 분류 네트워크
+- Stage 1: MF (Denoising) - 기존과 동일
+- Stage 2: Deep Classification Network (4층) + BAM - ⭐ 개선!
+"""
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import numpy as np
-from .bam_mf import MF, build_mf_module, build_decoder
-from .bam import BAM, BAMAssociativeLayer
+
+from .bam_mf import MF
+from .bam import BAMAssociativeLayer
 
 
-class SequentialBAM:
+class SequentialBAMv2:
     """
-    Sequential BAM: MF(복원) → BAM(분류)
+    2단계 Sequential BAM 모델 (개선 버전)
     
-    연쇄형 학습 절차:
-    1. Stage 1 (MF 학습): x_noisy → x_restored (MAE 손실)
-       - 손상된 입력을 복원하도록 MF 모듈 학습
-       
-    2. Stage 2 (BAM 학습): x_restored → y_bipolar
-       - 복원된 이미지로부터 분류
-       - BAMAssociativeLayer 사용 (반복 안정화)
-    
-    추론:
-    - x_noisy → MF → x_restored → BAM → y_pred
+    개선 사항:
+    - Classification에 deep network 추가 (4층)
+    - 점진적 차원 축소: 3072 → 1024 → 512 → 256 → 128
+    - 최종적으로 BAM으로 128 → 10 분류
     """
     
-    def __init__(self, input_dim=3072, denoise_latent=256, cls_latent=None, 
+    def __init__(self, input_dim=3072, denoise_latent=256, 
+                 cls_hidden_dims=[1024, 512, 256, 128],
                  num_classes=10, bam_steps=5, bam_temp=0.5):
         """
         Args:
-            input_dim: 입력 차원 (32*32*3 = 3072)
+            input_dim: 입력 차원 (CIFAR-10: 3072)
             denoise_latent: MF 잠재 차원
-            cls_latent: 사용 안함 (호환성 유지)
-            num_classes: 분류 클래스 수
+            cls_hidden_dims: 분류기 hidden layer 차원들 (NEW!)
+            num_classes: 클래스 개수
             bam_steps: BAM 반복 횟수
             bam_temp: BAM temperature
         """
         self.input_dim = input_dim
         self.denoise_latent = denoise_latent
+        self.cls_hidden_dims = cls_hidden_dims
         self.num_classes = num_classes
         self.bam_steps = bam_steps
         self.bam_temp = bam_temp
         
-        # MF 모듈 생성 (복원용)
-        encoder_dims = [1024, 768, 512, denoise_latent]
-        self.mf = MF(input_dim=input_dim, encoder_dims=encoder_dims)
+        # Stage 1: Denoising MF (기존과 동일)
+        self._build_denoise_model()
         
-        # Keras 모델로 래핑
-        self._build_keras_models()
-        
-    def _build_keras_models(self):
-        """MF와 BAM을 Keras 모델로 래핑"""
-        # Denoising 모델 (MF)
+        # Stage 2: Deep Classification Network (개선!)
+        self._build_classification_model()
+    
+    def _build_denoise_model(self):
+        """Stage 1: MF 복원 모델 (기존과 동일)"""
         noisy_input = layers.Input(shape=(self.input_dim,), name='noisy_input')
-        restored, _ = self.mf(noisy_input)
-        self.denoise_model = keras.Model(
-            inputs=noisy_input, 
-            outputs=restored, 
-            name='denoise_bam'
+        
+        # MF 모듈 생성
+        mf = MF(
+            input_dim=self.input_dim,
+            encoder_dims=[1024, 768, 512, self.denoise_latent]
         )
         
-        # Classification 모델 (BAM)
+        # 복원된 이미지와 잠재 표현
+        denoised, latent = mf(noisy_input)
+        
+        self.denoise_model = keras.Model(
+            inputs=noisy_input,
+            outputs=denoised,
+            name='denoise_bam'
+        )
+    
+    def _build_classification_model(self):
+        """
+        Stage 2: Deep Classification Network (개선!)
+        
+        구조:
+        3072 → [Dense 1024 + BN + ReLU + Dropout]
+             → [Dense 512 + BN + ReLU + Dropout]
+             → [Dense 256 + BN + ReLU + Dropout]
+             → [Dense 128 + BN + ReLU]
+             → [BAM 128 → 10]
+             → Softmax
+        """
         denoised_input = layers.Input(shape=(self.input_dim,), name='denoised_input')
         
-        # BAMAssociativeLayer 사용
+        x = denoised_input
+        
+        # ⭐ Deep hidden layers 추가!
+        for i, dim in enumerate(self.cls_hidden_dims):
+            x = layers.Dense(
+                dim,
+                kernel_initializer='glorot_uniform',
+                name=f'cls_dense_{i+1}'
+            )(x)
+            
+            x = layers.BatchNormalization(
+                momentum=0.99,
+                epsilon=1e-3,
+                name=f'cls_bn_{i+1}'
+            )(x)
+            
+            x = layers.Activation('relu', name=f'cls_relu_{i+1}')(x)
+            
+            # 앞쪽 레이어에만 dropout (과적합 방지)
+            if i < len(self.cls_hidden_dims) - 1:
+                x = layers.Dropout(0.3, name=f'cls_dropout_{i+1}')(x)
+        
+        # 최종 BAM 레이어
         cls_logits = BAMAssociativeLayer(
-            input_dim=self.input_dim,
-            output_dim=self.num_classes,
+            input_dim=self.cls_hidden_dims[-1],  # 128
+            output_dim=self.num_classes,  # 10
             steps=self.bam_steps,
             temp=self.bam_temp,
             name='bam_assoc'
-        )(denoised_input)
+        )(x)
         
         cls_output = layers.Activation('softmax', name='cls_output')(cls_logits)
         
         self.cls_model = keras.Model(
             inputs=denoised_input,
             outputs=cls_output,
-            name='classification_bam'
+            name='classification_bam_deep'
         )
     
-    def compile_models(self, denoise_lr=1e-3, cls_lr=2e-4):
+    def compile_models(self, denoise_lr=1e-3, cls_lr=1e-3):
         """
         두 모델을 독립적으로 컴파일
         
         Args:
             denoise_lr: MF 학습률
-            cls_lr: BAM 학습률
+            cls_lr: Classification 학습률 (높임!)
         """
-        # Stage 1: MF 복원 모델 (MAE 손실)
-        # ✅ Gradient clipping으로 안정성 확보 (NaN 방지)
+        # Stage 1: MF 복원 모델
         self.denoise_model.compile(
             optimizer=keras.optimizers.Adam(
                 learning_rate=denoise_lr,
-                clipnorm=1.0,      # gradient norm clipping
-                clipvalue=0.5      # gradient value clipping
+                clipnorm=1.0,
+                clipvalue=0.5
             ),
-            loss='mae',  # MAE 손실 사용
+            loss='mae',
             metrics=[
                 keras.metrics.MeanSquaredError(name="mse"),
                 keras.metrics.MeanAbsoluteError(name="mae")
             ]
         )
         
-        # Stage 2: BAM 분류 모델
+        # Stage 2: Deep Classification 모델
         self.cls_model.compile(
             optimizer=keras.optimizers.Adam(
-                learning_rate=cls_lr,
+                learning_rate=cls_lr,  # 더 높은 learning rate
                 clipnorm=1.0
             ),
             loss='categorical_crossentropy',
@@ -114,12 +155,12 @@ class SequentialBAM:
             ]
         )
         
-        print("✓ Models compiled successfully (with gradient clipping)")
+        print("✓ Models compiled successfully (Deep Classification Network)")
     
     def train_stage1(self, x_noisy, x_clean, epochs=50, batch_size=128,
                      validation_split=0.2, callbacks=None):
         """
-        Stage 1: MF 복원 학습
+        Stage 1: MF 복원 학습 (기존과 동일)
         
         Args:
             x_noisy: 노이즈가 추가된 입력 (flattened)
@@ -156,13 +197,10 @@ class SequentialBAM:
     def train_stage2(self, x_noisy, y_labels, epochs=50, batch_size=128,
                      validation_split=0.2, callbacks=None):
         """
-        Stage 2: BAM 분류 학습
-        
-        학습된 MF 모듈로 훈련 입력을 복원한 뒤,
-        복원된 이미지를 입력으로 BAM 분류기를 학습
+        Stage 2: Deep Classification 학습
         
         Args:
-            x_noisy: 노이즈가 추가된 입력 (복원용)
+            x_noisy: 노이즈가 추가된 입력 (flattened)
             y_labels: 원-핫 인코딩된 레이블
             epochs: 학습 에폭 수
             batch_size: 배치 크기
@@ -172,26 +210,27 @@ class SequentialBAM:
         Returns:
             학습 히스토리
         """
-        # 메모리 정리 (모델은 유지)
+        # 메모리 정리
         import gc
         gc.collect()
         
         print("\n" + "="*60)
-        print("Stage 2: Training Classification BAM")
+        print("Stage 2: Training Deep Classification Network + BAM")
         print("="*60)
-        print(f"BAM input dim: {self.input_dim}")
+        print(f"Architecture: Deep NN + BAM")
+        print(f"Hidden layers: {self.cls_hidden_dims}")
+        print(f"BAM input dim: {self.cls_hidden_dims[-1]}")
         print(f"BAM output dim: {self.num_classes}")
         print(f"BAM steps: {self.bam_steps}")
         print(f"BAM temperature: {self.bam_temp}")
         
-        # 1. MF로 훈련 데이터 복원 (배치 단위로 처리 - 메모리 효율)
-        print("Generating denoised images for training...")
+        # 1. MF로 훈련 데이터 복원 (배치 단위)
+        print("\nGenerating denoised images for training...")
         
         n_samples = len(x_noisy)
         x_restored_list = []
         
-        # 배치 단위로 복원 (메모리 절약)
-        for i in range(0, n_samples, batch_size * 4):  # 4배 큰 청크로
+        for i in range(0, n_samples, batch_size * 4):
             end_idx = min(i + batch_size * 4, n_samples)
             x_batch_restored = self.denoise_model.predict(
                 x_noisy[i:end_idx],
@@ -203,14 +242,13 @@ class SequentialBAM:
             if (i // (batch_size * 4)) % 10 == 0:
                 print(f"  Processed {end_idx}/{n_samples} samples...")
         
-        import numpy as np
         x_restored = np.concatenate(x_restored_list, axis=0)
-        del x_restored_list  # 메모리 해제
+        del x_restored_list
         
         print(f"✓ Restored images shape: {x_restored.shape}")
         
-        # 2. BAM 학습 (Keras fit 사용)
-        print("\nTraining BAM with softmax + categorical crossentropy")
+        # 2. Deep Classification Network 학습
+        print("\nTraining Deep Classification Network with softmax + categorical crossentropy")
         history2 = self.cls_model.fit(
             x_restored, y_labels,
             epochs=epochs,
@@ -225,36 +263,25 @@ class SequentialBAM:
     
     def predict(self, x_noisy, batch_size=128, verbose=0):
         """
-        연쇄 추론: x_noisy → MF → x_restored → BAM → y_pred
+        연쇄 추론: x_noisy → MF → x_restored → Deep NN + BAM → y_pred
         
         Args:
             x_noisy: 노이즈가 추가된 입력
             batch_size: 배치 크기
-            verbose: 진행 표시 레벨
+            verbose: 출력 레벨
             
         Returns:
-            dict: {
-                "denoised": 복원된 이미지,
-                "predictions": 클래스 확률
-            }
+            dict: {'denoised': 복원 이미지, 'predictions': 분류 결과}
         """
-        # Stage 1: MF로 복원
-        x_restored = self.denoise_model.predict(
-            x_noisy,
-            batch_size=batch_size,
-            verbose=verbose
-        )
+        # Stage 1: Denoising
+        x_denoised = self.denoise_model.predict(x_noisy, batch_size=batch_size, verbose=verbose)
         
-        # Stage 2: BAM으로 분류
-        y_pred = self.cls_model.predict(
-            x_restored,
-            batch_size=batch_size,
-            verbose=verbose
-        )
+        # Stage 2: Classification
+        y_pred = self.cls_model.predict(x_denoised, batch_size=batch_size, verbose=verbose)
         
         return {
-            "denoised": x_restored,
-            "predictions": y_pred
+            'denoised': x_denoised,
+            'predictions': y_pred
         }
     
     def evaluate(self, x_noisy, x_clean, y_labels, batch_size=128):
@@ -297,47 +324,6 @@ class SequentialBAM:
                 "top3_accuracy": float(top3_acc)
             }
         }
-    
-    def save_models(self, denoise_path="bam_mf_denoise.keras",
-                    cls_path="bam_classification.keras"):
-        """두 모델을 개별적으로 저장"""
-        self.denoise_model.save(denoise_path)
-        self.cls_model.save(cls_path)
-        print(f"✓ Models saved: {denoise_path}, {cls_path}")
-    
-    def load_models(self, denoise_path="bam_mf_denoise.keras",
-                    cls_path="bam_classification.keras"):
-        """저장된 모델 로드"""
-        self.denoise_model = keras.models.load_model(denoise_path)
-        self.cls_model = keras.models.load_model(cls_path)
-        print(f"✓ Models loaded: {denoise_path}, {cls_path}")
-
-
-# ============================================
-# 편의 함수
-# ============================================
-
-def create_sequential_bam(input_dim=3072, denoise_latent=256, num_classes=10,
-                          denoise_lr=1e-3, cls_lr=2e-4,
-                          bam_steps=5, bam_temp=0.5):
-    """
-    Sequential BAM 생성 및 컴파일 (one-liner)
-    
-    Returns:
-        컴파일된 SequentialBAM 인스턴스
-    """
-    seq_bam = SequentialBAM(
-        input_dim=input_dim,
-        denoise_latent=denoise_latent,
-        num_classes=num_classes,
-        bam_steps=bam_steps,
-        bam_temp=bam_temp
-    )
-    seq_bam.compile_models(
-        denoise_lr=denoise_lr,
-        cls_lr=cls_lr
-    )
-    return seq_bam
 
 
 # ============================================
@@ -345,31 +331,30 @@ def create_sequential_bam(input_dim=3072, denoise_latent=256, num_classes=10,
 # ============================================
 
 if __name__ == "__main__":
-    print("Creating Sequential BAM (MF + BAM)...")
+    print("Testing SequentialBAMv2...")
+    
+    # 더미 데이터
+    import numpy as np
+    x_noisy = np.random.randn(100, 3072).astype('float32')
+    x_clean = np.random.randn(100, 3072).astype('float32')
+    y_labels = np.eye(10)[np.random.randint(0, 10, 100)]
     
     # 모델 생성
-    seq_bam = create_sequential_bam(
+    model = SequentialBAMv2(
         input_dim=3072,
         denoise_latent=256,
-        num_classes=10,
-        bam_steps=5,
-        bam_temp=0.5
+        cls_hidden_dims=[1024, 512, 256, 128],  # Deep!
+        num_classes=10
     )
     
-    # 모델 구조 확인
-    print("\n" + "="*60)
-    print("Denoising Model (MF) Architecture:")
-    print("="*60)
-    seq_bam.denoise_model.summary()
+    # 모델 컴파일
+    model.compile_models(denoise_lr=1e-3, cls_lr=1e-3)
     
-    print("\n" + "="*60)
-    print("Classification Model (BAM) Architecture:")
-    print("="*60)
-    seq_bam.cls_model.summary()
+    print("\n[Denoise Model Summary]")
+    model.denoise_model.summary()
     
-    print("\n" + "="*60)
-    print("Sequential BAM initialized")
-    print("Stage 1: MF with MAE loss (No Dropout)")
-    print("Stage 2: BAMAssociativeLayer with iterative recall")
-    print("="*60)
+    print("\n[Classification Model Summary]")
+    model.cls_model.summary()
+    
+    print("\n✓ SequentialBAMv2 test passed")
 
