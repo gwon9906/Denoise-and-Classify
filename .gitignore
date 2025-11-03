@@ -9,3 +9,16 @@ __pycache__/
 *.pywz
 *.pyzw
 *.pyzwz
+
+# large data
+data/*.npy
+
+# training outputs
+weights/
+history/
+logs/
+results/
+backup/
+
+# documentation (temporary)
+BAM_V2_USAGE.md
