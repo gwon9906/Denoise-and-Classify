@@ -98,8 +98,8 @@ def add_burst_noise(clean_data, noise_standard_deviation, burst_type='dead_pixel
     affected_ratio = min(0.3, noise_standard_deviation * 3)
     
     if burst_type == 'dead_pixels':
+        num_dead_pixels = int(height * width * affected_ratio)
         for sample_idx in range(num_samples):
-            num_dead_pixels = int(height * width * affected_ratio)
             dead_positions = np.random.choice(height * width, num_dead_pixels, replace=False)
             
             for position in dead_positions:
@@ -108,8 +108,8 @@ def add_burst_noise(clean_data, noise_standard_deviation, burst_type='dead_pixel
                 noisy_data[sample_idx, row, col, :] = np.random.choice([0.0, 1.0])
     
     elif burst_type == 'column_row':
+        num_lines = max(1, int(max(height, width) * affected_ratio / 10))
         for sample_idx in range(num_samples):
-            num_lines = max(1, int(max(height, width) * affected_ratio / 10))
             
             for _ in range(num_lines):
                 if np.random.random() < 0.5:
