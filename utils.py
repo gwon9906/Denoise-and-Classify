@@ -38,31 +38,31 @@ def setup_gpu_memory(memory_limit_mb=8192):
         return False
 
 
-def add_noise_by_snr(clean_data, snr_db, noise_type='gaussian'):
+def add_noise_by_snr(clean_data, signal_to_noise_ratio_db, noise_type='gaussian'):
     """
     특정 SNR로 노이즈 추가
     
     Args:
         clean_data: 깨끗한 데이터 (N, H, W, C) 또는 (N, D)
-        snr_db: 목표 SNR (dB)
+        signal_to_noise_ratio_db: 목표 SNR (dB)
         noise_type: 'gaussian', 'sp', 'burst'
     
     Returns:
         노이즈가 추가된 데이터
     """
     signal_power = np.mean(clean_data ** 2)
-    snr_linear = 10 ** (snr_db / 10)
+    snr_linear = 10 ** (signal_to_noise_ratio_db / 10)
     noise_power = signal_power / snr_linear
-    noise_std = np.sqrt(noise_power)
+    noise_standard_deviation = np.sqrt(noise_power)
     
     if noise_type == 'gaussian':
-        noise = np.random.normal(0, noise_std, clean_data.shape).astype('float32')
+        noise = np.random.normal(0, noise_standard_deviation, clean_data.shape).astype('float32')
         noisy_data = clean_data + noise
     
     elif noise_type == 'sp':
         # Salt & Pepper noise
         noisy_data = clean_data.copy()
-        noise_ratio = min(0.5, noise_std * 2)
+        noise_ratio = min(0.5, noise_standard_deviation * 2)
         
         # Salt (1.0)
         salt_mask = np.random.random(clean_data.shape) < noise_ratio / 2
@@ -75,7 +75,7 @@ def add_noise_by_snr(clean_data, snr_db, noise_type='gaussian'):
     elif noise_type == 'burst':
         burst_types = ['dead_pixels', 'column_row', 'block']
         burst_type = np.random.choice(burst_types)
-        noisy_data = add_burst_noise(clean_data, noise_std, burst_type)
+        noisy_data = add_burst_noise(clean_data, noise_standard_deviation, burst_type)
     
     else:
         raise ValueError(f"Unknown noise type: {noise_type}")
@@ -83,60 +83,60 @@ def add_noise_by_snr(clean_data, snr_db, noise_type='gaussian'):
     return np.clip(noisy_data, 0.0, 1.0).astype('float32')
 
 
-def add_burst_noise(clean_data, noise_std, burst_type='dead_pixels'):
+def add_burst_noise(clean_data, noise_standard_deviation, burst_type='dead_pixels'):
     """
     Burst 노이즈 추가
     
     Args:
         clean_data: 깨끗한 데이터 (N, H, W, C)
-        noise_std: 노이즈 강도
+        noise_standard_deviation: 노이즈 강도
         burst_type: 'dead_pixels', 'column_row', 'block'
     """
     noisy_data = clean_data.copy()
-    N, H, W, C = clean_data.shape
+    num_samples, height, width, channels = clean_data.shape
     
-    affected_ratio = min(0.3, noise_std * 3)
+    affected_ratio = min(0.3, noise_standard_deviation * 3)
     
     if burst_type == 'dead_pixels':
-        for i in range(N):
-            num_dead = int(H * W * affected_ratio)
-            dead_positions = np.random.choice(H * W, num_dead, replace=False)
+        for sample_idx in range(num_samples):
+            num_dead_pixels = int(height * width * affected_ratio)
+            dead_positions = np.random.choice(height * width, num_dead_pixels, replace=False)
             
-            for pos in dead_positions:
-                row = pos // W
-                col = pos % W
-                noisy_data[i, row, col, :] = np.random.choice([0.0, 1.0])
+            for position in dead_positions:
+                row = position // width
+                col = position % width
+                noisy_data[sample_idx, row, col, :] = np.random.choice([0.0, 1.0])
     
     elif burst_type == 'column_row':
-        for i in range(N):
-            num_lines = max(1, int(max(H, W) * affected_ratio / 10))
+        for sample_idx in range(num_samples):
+            num_lines = max(1, int(max(height, width) * affected_ratio / 10))
             
             for _ in range(num_lines):
                 if np.random.random() < 0.5:
-                    col = np.random.randint(0, W)
-                    noisy_data[i, :, col, :] = np.random.choice([0.0, 1.0])
+                    col = np.random.randint(0, width)
+                    noisy_data[sample_idx, :, col, :] = np.random.choice([0.0, 1.0])
                 else:
-                    row = np.random.randint(0, H)
-                    noisy_data[i, row, :, :] = np.random.choice([0.0, 1.0])
+                    row = np.random.randint(0, height)
+                    noisy_data[sample_idx, row, :, :] = np.random.choice([0.0, 1.0])
     
     elif burst_type == 'block':
-        for i in range(N):
+        for sample_idx in range(num_samples):
             num_blocks = max(1, int(10 * affected_ratio))
             
             for _ in range(num_blocks):
-                block_h = np.random.randint(2, max(3, H // 4))
-                block_w = np.random.randint(2, max(3, W // 4))
+                block_height = np.random.randint(2, max(3, height // 4))
+                block_width = np.random.randint(2, max(3, width // 4))
                 
-                start_h = np.random.randint(0, H - block_h + 1)
-                start_w = np.random.randint(0, W - block_w + 1)
+                start_height = np.random.randint(0, height - block_height + 1)
+                start_width = np.random.randint(0, width - block_width + 1)
                 
                 block_value = np.random.choice([0.0, 1.0])
-                noisy_data[i, start_h:start_h+block_h, start_w:start_w+block_w, :] = block_value
+                noisy_data[sample_idx, start_height:start_height+block_height, start_width:start_width+block_width, :] = block_value
     
     return noisy_data
 
 
-def get_callbacks(model_name, monitor='val_loss', patience=30, initial_lr=1e-3, epochs=200):
+def get_callbacks(model_name, monitor='val_loss', patience=30, initial_learning_rate=1e-3, epochs=200):
     """
     학습 콜백 생성
     
@@ -144,11 +144,11 @@ def get_callbacks(model_name, monitor='val_loss', patience=30, initial_lr=1e-3, 
         model_name: 모델 이름
         monitor: 모니터링할 메트릭
         patience: Early stopping patience
-        initial_lr: 초기 학습률
+        initial_learning_rate: 초기 학습률
         epochs: 전체 에폭 수
     """
-    final_lr = initial_lr * 0.1
-    decay_rate = (final_lr / initial_lr) ** (1 / epochs)
+    final_learning_rate = initial_learning_rate * 0.1
+    decay_rate = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
     
     callbacks = []
     
@@ -171,11 +171,11 @@ def get_callbacks(model_name, monitor='val_loss', patience=30, initial_lr=1e-3, 
     callbacks.append(checkpoint)
     
     # 3. Learning Rate Scheduler (Exponential Decay)
-    def lr_schedule(epoch, lr):
-        return initial_lr * (decay_rate ** epoch)
+    def learning_rate_schedule(epoch, current_learning_rate):
+        return initial_learning_rate * (decay_rate ** epoch)
     
-    lr_scheduler = keras.callbacks.LearningRateScheduler(lr_schedule, verbose=0)
-    callbacks.append(lr_scheduler)
+    learning_rate_scheduler = keras.callbacks.LearningRateScheduler(learning_rate_schedule, verbose=0)
+    callbacks.append(learning_rate_scheduler)
     
     # 4. CSV Logger
     csv_logger = keras.callbacks.CSVLogger(
@@ -268,7 +268,7 @@ def create_directories():
     print("✓ Directories created:", ", ".join(directories))
 
 
-def print_training_config(epochs, batch_size, validation_split, initial_lr):
+def print_training_config(epochs, batch_size, validation_split, initial_learning_rate):
     """
     학습 설정 출력
     """
@@ -276,24 +276,24 @@ def print_training_config(epochs, batch_size, validation_split, initial_lr):
     print(f"  Epochs: {epochs}")
     print(f"  Batch size: {batch_size}")
     print(f"  Validation split: {validation_split}")
-    print(f"  Initial LR: {initial_lr}")
-    print(f"  Final LR: {initial_lr * 0.1} (10%)")
+    print(f"  Initial LR: {initial_learning_rate}")
+    print(f"  Final LR: {initial_learning_rate * 0.1} (10%)")
 
 
-def calculate_psnr(img1, img2):
+def calculate_psnr(image1, image2):
     """
     PSNR 계산
     
     Args:
-        img1: 첫 번째 이미지
-        img2: 두 번째 이미지
+        image1: 첫 번째 이미지
+        image2: 두 번째 이미지
     
     Returns:
         PSNR 값 (dB)
     """
-    mse = np.mean((img1 - img2) ** 2)
-    if mse == 0:
+    mean_squared_error = np.mean((image1 - image2) ** 2)
+    if mean_squared_error == 0:
         return float('inf')
-    max_pixel = 1.0
-    psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
+    max_pixel_value = 1.0
+    psnr = 20 * np.log10(max_pixel_value / np.sqrt(mean_squared_error))
     return psnr

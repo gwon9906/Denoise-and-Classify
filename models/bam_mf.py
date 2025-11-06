@@ -6,25 +6,25 @@ from tensorflow.keras import layers
 # 포화성 큐빅 활성화 함수
 # ============================================
 
-def cubic_activation(x):
+def cubic_activation(input_tensor):
     """
     단순 큐빅 활성화: x - x^3/3 (안정화 버전)
     입력을 clipping하여 수치 안정성 보장
     """
     # ✅ 입력 clipping으로 수치 안정성 확보 (NaN 방지)
-    x_clipped = tf.clip_by_value(x, -10.0, 10.0)
-    return x_clipped - tf.pow(x_clipped, 3) / 3.0
+    clipped_input = tf.clip_by_value(input_tensor, -10.0, 10.0)
+    return clipped_input - tf.pow(clipped_input, 3) / 3.0
 
 
 # Soft Sign 함수 (BAM 안정화용)
 
 
-def soft_sign(x, temp=1.0):
+def soft_sign(input_tensor, temp=1.0):
     """
     소프트 사인 함수 (tanh 기반)
     temp: temperature parameter (낮을수록 sharp)
     """
-    return tf.tanh(x / temp)
+    return tf.tanh(input_tensor / temp)
 
 
 # HebbianDenseLayer (W, V 분리, BatchNorm 사용)
@@ -47,27 +47,27 @@ class HebbianDenseLayer(layers.Layer):
         self.use_feedback = use_feedback
     
     def build(self, input_shape):
-        d_in = input_shape[-1]
+        input_dimension = input_shape[-1]
         
         # Feedforward 가중치 W
-        self.W = self.add_weight(
-            shape=(d_in, self.units),
+        self.feedforward_weights = self.add_weight(
+            shape=(input_dimension, self.units),
             initializer='glorot_uniform',  # ✅ glorot이 cubic activation에 더 안정적
             trainable=True,
-            name='W'
+            name='feedforward_weights'
         )
         
         # Feedback 가중치 V (선택적, 현재 미사용)
         # if self.use_feedback:
-        #     self.V = self.add_weight(
-        #         shape=(self.units, d_in),
+        #     self.feedback_weights = self.add_weight(
+        #         shape=(self.units, input_dimension),
         #         initializer='he_uniform',
         #         trainable=True,
-        #         name='V'
+        #         name='feedback_weights'
         #     )
         
         # ✅ BatchNormalization 안정화 설정
-        self.norm = layers.BatchNormalization(
+        self.normalization_layer = layers.BatchNormalization(
             momentum=0.99,  # 더 안정적인 이동 평균
             epsilon=1e-3,    # 수치 안정성
             center=True,
@@ -78,14 +78,14 @@ class HebbianDenseLayer(layers.Layer):
     
     def call(self, inputs, training=None):
         # Feedforward: x -> W -> z
-        z = tf.matmul(inputs, self.W)
-        z = self.norm(z, training=training)
+        layer_output = tf.matmul(inputs, self.feedforward_weights)
+        layer_output = self.normalization_layer(layer_output, training=training)
         
         # Activation
         if self.activation is not None:
-            z = self.activation(z)
+            layer_output = self.activation(layer_output)
         
-        return z
+        return layer_output
     
     def get_config(self):
         config = super().get_config()
@@ -154,21 +154,21 @@ class MF(tf.keras.Model):
                 )
             self.decoder_layers.append(layer)
     
-    def encode(self, x, training=None):
+    def encode(self, inputs, training=None):
         """입력 x를 잠재 표현 z로 인코딩"""
-        z = x
+        encoded = inputs
         for layer in self.encoder_layers:
-            z = layer(z, training=training)
-        return z
+            encoded = layer(encoded, training=training)
+        return encoded
     
-    def decode(self, z, training=None):
+    def decode(self, latent_representation, training=None):
         """잠재 표현 z로부터 입력 형태로 복원"""
-        out = z
+        decoded = latent_representation
         for layer in self.decoder_layers:
-            out = layer(out, training=training)
-        return out
+            decoded = layer(decoded, training=training)
+        return decoded
     
-    def call(self, x, training=None):
+    def call(self, inputs, training=None):
         """
         MF 모듈을 통해 입력을 복원하고 잠재 표현도 반환
         
@@ -176,19 +176,19 @@ class MF(tf.keras.Model):
             (복원 이미지, 잠재 표현)
         """
         # ✅ 입력 검증 및 clipping (NaN 방지)
-        x = tf.clip_by_value(x, 0.0, 1.0)
+        inputs = tf.clip_by_value(inputs, 0.0, 1.0)
         
-        z = self.encode(x, training=training)
+        latent_representation = self.encode(inputs, training=training)
         
         # ✅ 잠재 표현 안정화 (gradient explosion 방지)
-        z = tf.clip_by_value(z, -100.0, 100.0)
+        latent_representation = tf.clip_by_value(latent_representation, -100.0, 100.0)
         
-        out = self.decode(z, training=training)
+        restored_output = self.decode(latent_representation, training=training)
         
         # ✅ 출력 안정화 (sigmoid 후에도 보장)
-        out = tf.clip_by_value(out, 0.0, 1.0)
+        restored_output = tf.clip_by_value(restored_output, 0.0, 1.0)
         
-        return out, z
+        return restored_output, latent_representation
     
     def get_config(self):
         return {
@@ -201,51 +201,52 @@ class MF(tf.keras.Model):
 # 편의 함수: MF 모듈 빌드
 # ============================================
 
-def build_mf_module(input_vec, hidden_units=[1024, 768, 512, 256]):
+def build_mf_module(input_vector, hidden_units=[1024, 768, 512, 256]):
     """
     함수형 API로 MF 모듈 빌드
     
     Args:
-        input_vec: 입력 텐서
+        input_vector: 입력 텐서
         hidden_units: 은닉층 차원 리스트
         
     Returns:
         잠재 표현 텐서
     """
-    x = input_vec
-    for i, units in enumerate(hidden_units):
-        x = HebbianDenseLayer(
+    current_layer = input_vector
+    for layer_idx, units in enumerate(hidden_units):
+        current_layer = HebbianDenseLayer(
             units,
             activation=cubic_activation,
-            name=f"mf_layer_{i+1}"
-        )(x)
-    return x
+            name=f"mf_layer_{layer_idx+1}"
+        )(current_layer)
+    return current_layer
 
 
-def build_decoder(x, decoder_units=[512, 768, 1024], original_dim=3072):
+def build_decoder(latent_representation, decoder_units=[512, 768, 1024], original_dimension=3072):
     """
     함수형 API로 디코더 빌드
     
     Args:
-        x: 잠재 표현 텐서
+        latent_representation: 잠재 표현 텐서
         decoder_units: 디코더 은닉층 차원 리스트
-        original_dim: 원본 입력 차원
+        original_dimension: 원본 입력 차원
         
     Returns:
         복원된 출력 텐서
     """
-    for i, u in enumerate(decoder_units):
-        x = HebbianDenseLayer(
-            u,
+    current_layer = latent_representation
+    for layer_idx, units in enumerate(decoder_units):
+        current_layer = HebbianDenseLayer(
+            units,
             activation=cubic_activation,
-            name=f"decoder_layer_{i+1}"
-        )(x)
+            name=f"decoder_layer_{layer_idx+1}"
+        )(current_layer)
     
     return layers.Dense(
-        original_dim,
+        original_dimension,
         activation='sigmoid',
         name='restoration_output'
-    )(x)
+    )(current_layer)
 
 
 # ============================================
